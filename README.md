@@ -7,7 +7,7 @@
 [![GNOME](https://img.shields.io/badge/GNOME_Shell-50-4A86CF?style=flat&logo=gnome&logoColor=white)](https://www.gnome.org/)
 [![Wayland](https://img.shields.io/badge/Wayland-only-FFBC00?style=flat)](https://wayland.freedesktop.org/)
 [![GJS](https://img.shields.io/badge/GJS-ESM-729FCF?style=flat&logo=javascript&logoColor=white)](https://gjs.guide/)
-[![License](https://img.shields.io/badge/License-MIT-green?style=flat)](#license)
+[![License](https://img.shields.io/badge/License-MIT-green?style=flat)](LICENSE)
 
 </div>
 
@@ -165,4 +165,4 @@ journalctl -f -o cat /usr/bin/gnome-shell | grep display-rescue
 
 ## License
 
-MIT © 2026 Star-Barsuk
+[MIT](LICENSE) © 2026 Star-Barsuk
