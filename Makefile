@@ -5,10 +5,11 @@ ZIPFILE = $(UUID).zip
 SCHEMAS = schemas/org.gnome.shell.extensions.display-rescue.gschema.xml
 COMPILED_SCHEMAS = schemas/gschemas.compiled
 
-SRC = extension.js prefs.js metadata.json
+SRC = extension.js displayLogic.js prefs.js metadata.json
 SCHEMA_DIR = schemas
+TESTS = tests/run.js
 
-.PHONY: build install uninstall enable disable zip lint clean
+.PHONY: build install uninstall enable disable zip test lint clean
 
 build: $(COMPILED_SCHEMAS)
 
@@ -39,15 +40,12 @@ zip: build
 	cd _zipdir && zip -qr ../$(ZIPFILE) $(UUID)
 	rm -rf _zipdir
 
-lint:
-	@if command -v gjs >/dev/null 2>&1; then \
-		for f in extension.js prefs.js; do \
-			echo "Checking $$f syntax..."; \
-			gjs -c "$$f" 2>/dev/null || echo "  (skipped: external imports)"; \
-		done; \
-	else \
-		echo "gjs not found, skipping lint"; \
-	fi
+test:
+	gjs -m tests/run.js
+
+lint: test
+	python3 -c "import json; json.load(open('metadata.json')); print('metadata.json: valid')"
+	python3 -c "import xml.dom.minidom; xml.dom.minidom.parse('$(SCHEMAS)'); print('schema xml: valid')"
 
 clean:
 	rm -f $(COMPILED_SCHEMAS)

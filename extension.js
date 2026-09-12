@@ -4,19 +4,29 @@ import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
+import {
+    LAYOUT_LOGICAL,
+    SAFE_H,
+    SAFE_RATE,
+    SAFE_SCALE,
+    SAFE_W,
+    TRANSFORM_NORMAL,
+    buildConnectorIndex,
+    buildJoinMonitors,
+    buildMirrorMembers,
+    buildSafeMirrorsXml,
+    collectExternalSpecsFromXml,
+    isBuiltinConnector,
+    orderConnectors,
+    pickModeId,
+} from './displayLogic.js';
 
 const BUS_NAME = 'org.gnome.Mutter.DisplayConfig';
 const OBJECT_PATH = '/org/gnome/Mutter/DisplayConfig';
-const LAYOUT_LOGICAL = 1;
 
 const METHOD_VERIFY = 0;
 const METHOD_PERSISTENT = 2;
 const METHOD_TEMPORARY = 1;
-
-const TRANSFORM_NORMAL = 0;
-const SAFE_W = 1920;
-const SAFE_H = 1080;
-const SAFE_SCALE = 1.0;
 
 class DisplayConfigClient {
     constructor() {
@@ -43,6 +53,16 @@ class DisplayConfigClient {
                 }
             );
         });
+    }
+
+    release() {
+        // Drop the proxy explicitly so disable() frees the session
+        // reference immediately instead of waiting for the GC sweep.
+        this._proxy = null;
+    }
+
+    get ready() {
+        return this._proxy !== null;
     }
 
     call(method, params) {
@@ -79,110 +99,6 @@ class DisplayConfigClient {
     }
 }
 
-function buildConnectorIndex(monitors) {
-    // monitors: [ [spec, modes, props], ... ]
-    // spec: [connector, vendor, product, serial]
-    const index = new Map();
-    for (const entry of monitors) {
-        const [spec, modes] = entry;
-        const connector = spec[0];
-        let current = null;
-        let preferred = null;
-        for (const mode of modes) {
-            const [modeId, width, height, refresh, preferredScale, supportedScales, modeProps] = mode;
-            const info = {modeId, width, height, refresh, preferredScale, supportedScales, modeProps};
-            if (modeProps && modeProps['is-current'])
-                current = info;
-            if (modeProps && modeProps['is-preferred'])
-                preferred = info;
-        }
-        index.set(connector, {
-            spec,
-            modes: modes.map(m => ({
-                modeId: m[0],
-                width: m[1],
-                height: m[2],
-                refresh: m[3],
-                preferredScale: m[4],
-                supportedScales: m[5],
-                modeProps: m[6],
-            })),
-            current,
-            preferred,
-        });
-    }
-    return index;
-}
-
-function currentScaleFor(logicalMonitors, connector) {
-    for (const lm of logicalMonitors) {
-        const scale = lm[2];
-        const members = lm[5];
-        for (const m of members) {
-            if (m[0] === connector)
-                return scale;
-        }
-    }
-    return SAFE_SCALE;
-}
-
-function pickModeId(entry, width, height) {
-    // Prefer exact size at 60Hz, prefer is-current within that size.
-    const sized = entry.modes.filter(m => m.width === width && m.height === height);
-    if (sized.length === 0)
-        return null;
-    const at60 = sized.filter(m => Math.abs(m.refresh - 60.0) < 0.5);
-    const pool = at60.length > 0 ? at60 : sized;
-    const current = pool.find(m => m.modeProps && m.modeProps['is-current']);
-    if (current)
-        return current.modeId;
-    const preferred = pool.find(m => m.modeProps && m.modeProps['is-preferred']);
-    if (preferred)
-        return preferred.modeId;
-    return pool[0].modeId;
-}
-
-function findCommonSize(index) {
-    // Intersection of WxH across all outputs, largest first.
-    const lists = [...index.values()].map(e => e.modes.map(m => `${m.width}x${m.height}`));
-    if (lists.length === 0)
-        return null;
-    const counts = new Map();
-    for (const list of lists) {
-        for (const size of new Set(list))
-            counts.set(size, (counts.get(size) || 0) + 1);
-    }
-    const common = [...counts.entries()]
-        .filter(([, n]) => n === lists.length)
-        .map(([size]) => size);
-    if (common.length === 0)
-        return null;
-    // Prefer 1920x1080 for TV compatibility, else largest area.
-    if (common.includes(`${SAFE_W}x${SAFE_H}`))
-        return {width: SAFE_W, height: SAFE_H};
-    common.sort((a, b) => {
-        const [aw, ah] = a.split('x').map(Number);
-        const [bw, bh] = b.split('x').map(Number);
-        return bw * bh - aw * ah;
-    });
-    const [width, height] = common[0].split('x').map(Number);
-    return {width, height};
-}
-
-function orderConnectors(connectors) {
-    // Built-in first as primary (vanilla Settings behavior), then HDMI/others sorted.
-    const score = c => {
-        if (c.startsWith('eDP') || c.startsWith('LVDS'))
-            return 0;
-        if (c.startsWith('HDMI'))
-            return 1;
-        if (c.startsWith('DP'))
-            return 2;
-        return 3;
-    };
-    return [...connectors].sort((a, b) => score(a) - score(b) || (a < b ? -1 : 1));
-}
-
 function showOsd(text) {
     try {
         Main.osdWindowManager.show(-1, Gio.ThemedIcon.new('video-display-symbolic'), text, null, null);
@@ -212,79 +128,6 @@ function monitorsXmlPath() {
     return GLib.build_filenamev([GLib.get_home_dir(), '.config', 'monitors.xml']);
 }
 
-function escapeXml(value) {
-    return String(value)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
-}
-
-function collectExternalSpecsFromXml(text) {
-    // Harvest every non-built-in monitorspec ever stored, so a future
-    // EDID flip (KOA vs BDL dongles) still matches a safe mirror config.
-    const specs = [];
-    const re = /<monitor>\s*<monitorspec>\s*<connector>([^<]*)<\/connector>\s*<vendor>([^<]*)<\/vendor>\s*<product>([^<]*)<\/product>\s*<serial>([^<]*)<\/serial>/g;
-    let m;
-    while ((m = re.exec(text)) !== null) {
-        if (/^(eDP|LVDS)/.test(m[1]))
-            continue;
-        specs.push([m[1], m[2], m[3], m[4]]);
-    }
-    return specs;
-}
-
-function buildSafeMirrorsXml(builtinSpec, builtinMode, externalSpecs) {
-    const monitorBlock = (spec, w, h, rate) => `      <monitor>
-        <monitorspec>
-          <connector>${escapeXml(spec[0])}</connector>
-          <vendor>${escapeXml(spec[1])}</vendor>
-          <product>${escapeXml(spec[2])}</product>
-          <serial>${escapeXml(spec[3])}</serial>
-        </monitorspec>
-        <mode>
-          <width>${w}</width>
-          <height>${h}</height>
-          <rate>${rate}</rate>
-        </mode>
-      </monitor>`;
-    const builtinBlock = monitorBlock(builtinSpec, builtinMode.width, builtinMode.height, builtinMode.rate);
-    const parts = externalSpecs.map(ext => `  <configuration>
-    <layoutmode>logical</layoutmode>
-    <logicalmonitor>
-      <x>0</x>
-      <y>0</y>
-      <scale>1</scale>
-      <primary>yes</primary>
-${builtinBlock}
-${monitorBlock(ext, SAFE_W, SAFE_H, '60.000')}
-    </logicalmonitor>
-  </configuration>`);
-    if (parts.length === 0) {
-        parts.push(`  <configuration>
-    <layoutmode>logical</layoutmode>
-    <logicalmonitor>
-      <x>0</x>
-      <y>0</y>
-      <scale>1</scale>
-      <primary>yes</primary>
-${builtinBlock}
-    </logicalmonitor>
-  </configuration>`);
-    }
-    return `<monitors version="2">\n${parts.join('\n')}\n</monitors>\n`;
-}
-
-function writeMonitorsXml(text) {
-    const dest = Gio.File.new_for_path(monitorsXmlPath());
-    dest.replace_contents(
-        new TextEncoder().encode(text),
-        null,
-        false,
-        Gio.FileCreateFlags.REPLACE_DESTINATION,
-        null
-    );
-}
-
 function backupMonitorsXml() {
     const path = monitorsXmlPath();
     const src = Gio.File.new_for_path(path);
@@ -301,6 +144,17 @@ function backupMonitorsXml() {
     }
 }
 
+function writeMonitorsXml(text) {
+    const dest = Gio.File.new_for_path(monitorsXmlPath());
+    dest.replace_contents(
+        new TextEncoder().encode(text),
+        null,
+        false,
+        Gio.FileCreateFlags.REPLACE_DESTINATION,
+        null
+    );
+}
+
 export default class DisplayRescueExtension extends Extension {
     enable() {
         this._settings = this.getSettings();
@@ -308,10 +162,15 @@ export default class DisplayRescueExtension extends Extension {
         this._starting = this._client.init().catch(e => {
             log(`[display-rescue] DisplayConfig proxy failed: ${e.message}`);
         });
+        // Busy flag bounds transient memory under key spam: one in-flight
+        // apply at a time, no stacked unpacked states. Epoch discards late
+        // results after disable() instead of retaining a dead client.
+        this._busy = false;
+        this._epoch = (this._epoch || 0) + 1;
 
-        this._mirrorHandler = () => this._onMirror().catch(e => this._onError('Mirror', e));
-        this._joinHandler = () => this._onJoin().catch(e => this._onError('Join', e));
-        this._resetHandler = () => this._onReset().catch(e => this._onError('Reset', e));
+        this._mirrorHandler = () => this._runExclusive('Mirror', () => this._onMirror());
+        this._joinHandler = () => this._runExclusive('Join', () => this._onJoin());
+        this._resetHandler = () => this._runExclusive('Reset', () => this._onReset());
 
         const flags = Meta.KeyBindingFlags.IGNORE_AUTOREPEAT;
         const mode = Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW;
@@ -321,6 +180,10 @@ export default class DisplayRescueExtension extends Extension {
     }
 
     disable() {
+        // Bump the epoch first so any in-flight handler abandons its work
+        // instead of touching a released client.
+        this._epoch = (this._epoch || 0) + 1;
+        this._busy = false;
         for (const key of ['mirror', 'join', 'reset']) {
             try {
                 Main.wm.removeKeybinding(key);
@@ -328,23 +191,46 @@ export default class DisplayRescueExtension extends Extension {
                 // Already removed.
             }
         }
+        if (this._client) {
+            this._client.release();
+            this._client = null;
+        }
+        this._settings = null;
+        this._starting = null;
         this._mirrorHandler = null;
         this._joinHandler = null;
         this._resetHandler = null;
-        this._client = null;
-        this._settings = null;
-        this._starting = null;
     }
 
     async _ready() {
-        if (this._starting)
+        if (this._starting) {
             await this._starting;
-        if (!this._client || !this._client._proxy)
+            // Release the startup promise chain after first use: it is only
+            // needed once, retaining it for the session lifetime is waste.
+            this._starting = null;
+        }
+        if (!this._client || !this._client.ready)
             throw new Error('DisplayConfig service unavailable');
     }
 
-    async _applyWithVerify(serial, logicalMonitors, properties) {
-        // Verify first (no side effects), then persist like Settings does.
+    _runExclusive(action, fn) {
+        if (this._busy) {
+            log(`[display-rescue] ${action} ignored: another apply in flight`);
+            return Promise.resolve();
+        }
+        this._busy = true;
+        const epoch = this._epoch;
+        return fn().catch(e => this._onError(action, e)).finally(() => {
+            if (this._epoch === epoch)
+                this._busy = false;
+        });
+    }
+
+    _alive(epoch) {
+        return this._client !== null && this._epoch === epoch;
+    }
+
+    async _attemptApply(serial, logicalMonitors, properties) {
         try {
             await this._client.apply(serial, METHOD_VERIFY, logicalMonitors, properties);
         } catch (e) {
@@ -352,88 +238,86 @@ export default class DisplayRescueExtension extends Extension {
         }
         try {
             await this._client.apply(serial, METHOD_PERSISTENT, logicalMonitors, properties);
+            return;
         } catch (e) {
-            // Fall back to temporary so blind users still get a picture.
-            await this._client.apply(serial, METHOD_TEMPORARY, logicalMonitors, properties);
+            log(`[display-rescue] persistent apply failed, retrying with fresh serial: ${e.message}`);
+        }
+        // The serial may have gone stale in a hotplug race: refetch once
+        // and retry persistent, then fall back to temporary on the same
+        // fresh serial instead of a third round-trip with a dead one.
+        const fresh = await this._client.getState();
+        try {
+            await this._client.apply(fresh.serial, METHOD_PERSISTENT, logicalMonitors, properties);
+        } catch (e) {
+            await this._client.apply(fresh.serial, METHOD_TEMPORARY, logicalMonitors, properties);
         }
     }
 
     async _onMirror() {
         await this._ready();
+        const epoch = this._epoch;
         const {serial, monitors} = await this._client.getState();
+        if (!this._alive(epoch))
+            return;
         const index = buildConnectorIndex(monitors);
         const connectors = orderConnectors([...index.keys()]);
         if (connectors.length === 0)
             throw new Error('no outputs found');
-
-        const common = findCommonSize(index) || {width: SAFE_W, height: SAFE_H};
-        const members = [];
-        for (const connector of connectors) {
-            const modeId = pickModeId(index.get(connector), common.width, common.height)
-                || index.get(connector).current?.modeId
-                || index.get(connector).preferred?.modeId
-                || index.get(connector).modes[0].modeId;
-            members.push([connector, modeId, {}]);
-        }
-        const logicalMonitors = [[0, 0, SAFE_SCALE, TRANSFORM_NORMAL, true, members]];
-        const properties = {'layout-mode': GLib.Variant.new_uint32(LAYOUT_LOGICAL)};
-        await this._applyWithVerify(serial, logicalMonitors, properties);
+        const {members, common} = buildMirrorMembers(index, connectors);
+        await this._attemptApply(serial, [[0, 0, SAFE_SCALE, TRANSFORM_NORMAL, true, members]],
+            {'layout-mode': GLib.Variant.new_uint32(LAYOUT_LOGICAL)});
+        if (!this._alive(epoch))
+            return;
         warpToPrimaryCenter();
         showOsd(`Mirror ${common.width}x${common.height}`);
+        log(`[display-rescue] Mirror applied: ${common.width}x${common.height} on ${connectors.join(',')}`);
     }
 
     async _onJoin() {
         await this._ready();
+        const epoch = this._epoch;
         const {serial, monitors, logicalMonitors: currentLogical} = await this._client.getState();
+        if (!this._alive(epoch))
+            return;
         const index = buildConnectorIndex(monitors);
         const connectors = orderConnectors([...index.keys()]);
         if (connectors.length < 2) {
             showOsd('Join needs 2 outputs');
             return;
         }
-
-        // Vanilla behavior: keep each output current mode/scale, place side by side.
-        const logicalMonitors = [];
-        let x = 0;
-        connectors.forEach((connector, i) => {
-            const entry = index.get(connector);
-            const modeId = entry.current?.modeId || entry.preferred?.modeId || entry.modes[0].modeId;
-            const mode = entry.modes.find(m => m.modeId === modeId) || entry.modes[0];
-            let scale = currentScaleFor(currentLogical, connector);
-            if (!Number.isFinite(scale) || scale <= 0)
-                scale = SAFE_SCALE;
-            if (!mode.supportedScales.includes(scale))
-                scale = mode.preferredScale || SAFE_SCALE;
-            const primary = i === 0;
-            logicalMonitors.push([x, 0, scale, TRANSFORM_NORMAL, primary, [[connector, modeId, {}]]]);
-            x += Math.round(mode.width / scale);
-        });
-        const properties = {'layout-mode': GLib.Variant.new_uint32(LAYOUT_LOGICAL)};
-        await this._applyWithVerify(serial, logicalMonitors, properties);
+        const logicalMonitors = buildJoinMonitors(index, connectors, currentLogical);
+        await this._attemptApply(serial, logicalMonitors,
+            {'layout-mode': GLib.Variant.new_uint32(LAYOUT_LOGICAL)});
+        if (!this._alive(epoch))
+            return;
         warpToPrimaryCenter();
         showOsd('Join (extend)');
+        log(`[display-rescue] Join applied on ${connectors.join(',')}`);
     }
 
     async _onReset() {
         await this._ready();
+        const epoch = this._epoch;
         const backupPath = backupMonitorsXml();
         const {serial, monitors} = await this._client.getState();
+        if (!this._alive(epoch))
+            return;
         const index = buildConnectorIndex(monitors);
         const connectors = orderConnectors([...index.keys()]);
-
         const members = [];
         for (const connector of connectors) {
             const entry = index.get(connector);
             const modeId = pickModeId(entry, SAFE_W, SAFE_H)
-                || entry.current?.modeId
+                || (entry.current && entry.current.modeId)
                 || entry.modes[0].modeId;
             members.push([connector, modeId, {}]);
         }
         if (members.length === 0)
             throw new Error('no outputs found');
-        const logicalMonitors = [[0, 0, SAFE_SCALE, TRANSFORM_NORMAL, true, members]];
-        const properties = {'layout-mode': GLib.Variant.new_uint32(LAYOUT_LOGICAL)};
-        await this._applyWithVerify(serial, logicalMonitors, properties);
+        await this._attemptApply(serial, [[0, 0, SAFE_SCALE, TRANSFORM_NORMAL, true, members]],
+            {'layout-mode': GLib.Variant.new_uint32(LAYOUT_LOGICAL)});
+        if (!this._alive(epoch))
+            return;
         // Purge stale configs (e.g. the 4K Join) so the next hotplug or
         // EDID flip cannot resurrect the bad layout automatically.
         try {
@@ -443,17 +327,18 @@ export default class DisplayRescueExtension extends Extension {
         }
         warpToPrimaryCenter();
         showOsd(backupPath ? `Reset to 1080p mirror (backup kept)` : 'Reset to 1080p mirror');
+        log('[display-rescue] Reset applied: 1080p mirror, stale configs purged');
     }
 
     _purgeStaleConfigs(liveMonitors) {
         let builtinSpec = null;
-        let builtinMode = {width: SAFE_W, height: SAFE_H, rate: '60.000'};
+        let builtinMode = {width: SAFE_W, height: SAFE_H, rate: SAFE_RATE};
         for (const entry of liveMonitors) {
             const spec = entry[0];
             const modes = entry[1];
             const props = entry[2];
-            const isBuiltin = (props && props['is-builtin']) || /^(eDP|LVDS)/.test(spec[0]);
-            if (isBuiltin && !builtinSpec) {
+            const builtin = (props && props['is-builtin']) || isBuiltinConnector(spec[0]);
+            if (builtin && !builtinSpec) {
                 builtinSpec = spec;
                 const current = modes.find(m => m[6] && m[6]['is-current']) || modes[0];
                 if (current) {
@@ -476,8 +361,8 @@ export default class DisplayRescueExtension extends Extension {
         for (const entry of liveMonitors) {
             const spec = entry[0];
             const props = entry[2];
-            const isBuiltin = (props && props['is-builtin']) || /^(eDP|LVDS)/.test(spec[0]);
-            if (!isBuiltin)
+            const builtin = (props && props['is-builtin']) || isBuiltinConnector(spec[0]);
+            if (!builtin)
                 addSpec(spec);
         }
         try {
