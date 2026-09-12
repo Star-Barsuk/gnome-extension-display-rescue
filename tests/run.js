@@ -2,6 +2,7 @@
 // Fails fast with a nonzero exit code on the first broken expectation.
 
 import {
+    assessExternalLayout,
     buildConnectorIndex,
     buildJoinMonitors,
     buildMirrorMembers,
@@ -84,5 +85,36 @@ const xml = buildSafeMirrorsXml(['eDP-1', 'CSO', '0x142e', '0x00000000'],
     [['HDMI-1', 'KOA', 'OneMeeting', '0x00000001']]);
 check('xml has one mirror config', (xml.match(/<configuration>/g) || []).length, 1);
 check('xml has no 4K', xml.includes('3840'), false);
+
+// Watcher decision logic: replug assessment.
+const JOIN_4K_LOGICAL = [
+    [0, 0, 1.25, 0, true, [['eDP-1', 'CSO', '0x142e', '0x00000000']], {}],
+    [1536, 0, 1.0, 0, false, [['HDMI-1', 'BDL', 'OneMeeting', '0x01010101']], {}],
+];
+const MONITORS_BDL_4K = [
+    MONITORS[0],
+    [['HDMI-1', 'BDL', 'OneMeeting', '0x01010101'], [
+        ['3840x2160@30.000', 3840, 2160, 30.0, 1.0, [1.0],
+            {'is-current': true, 'is-preferred': true}],
+        ['1920x1080@60.000', 1920, 1080, 60.0, 1.0, [1.0], {}],
+    ], {'is-builtin': false}],
+];
+const KNOWN = [['HDMI-1', 'KOA', 'OneMeeting', '0x00000001']];
+
+const badFlip = assessExternalLayout(MONITORS_BDL_4K, JOIN_4K_LOGICAL, KNOWN);
+check('flip flags unknown EDID', badFlip.unknownExternal,
+    [['HDMI-1', 'BDL', 'OneMeeting', '0x01010101']]);
+check('flip flags oversized join', badFlip.oversizedJoin, true);
+check('flip needs hint', badFlip.needsHint, true);
+
+const cleanMirror = assessExternalLayout(MONITORS, LOGICAL_MIRROR, KNOWN);
+check('known mirror needs no hint', cleanMirror.needsHint, false);
+
+const JOIN_1080_LOGICAL = [
+    [0, 0, 1.0, 0, true, [['eDP-1', 'CSO', '0x142e', '0x00000000']], {}],
+    [1920, 0, 1.0, 0, false, [['HDMI-1', 'KOA', 'OneMeeting', '0x00000001']], {}],
+];
+const cleanJoin = assessExternalLayout(MONITORS, JOIN_1080_LOGICAL, KNOWN);
+check('known 1080p join needs no hint', cleanJoin.needsHint, false);
 
 print(`\n${passed} assertions passed`);

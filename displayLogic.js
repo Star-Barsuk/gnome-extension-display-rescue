@@ -219,3 +219,28 @@ ${builtinBlock}
     }
     return `<monitors version="2">\n${parts.join('\n')}\n</monitors>\n`;
 }
+
+export function assessExternalLayout(liveMonitors, logicalMonitors, knownExternalSpecs) {
+    // Decides whether the user needs a blind hint after a replug, without
+    // ever switching anything automatically. Returns plain data so the
+    // shell side only formats and shows it.
+    // liveMonitors: raw unpacked GetCurrentState entries [spec, modes, props].
+    // knownExternalSpecs: specs harvested from monitors.xml history.
+    const known = new Set((knownExternalSpecs || []).map(s => s.join('|')));
+    const unknownExternal = [];
+    let oversizedJoin = false;
+    const joined = logicalMonitors.length > 1;
+    for (const entry of liveMonitors) {
+        const spec = entry[0];
+        const modes = entry[1];
+        const props = entry[2];
+        if ((props && props['is-builtin']) || isBuiltinConnector(spec[0]))
+            continue;
+        if (!known.has(spec.join('|')))
+            unknownExternal.push(spec);
+        const current = modes.find(m => m[6] && m[6]['is-current']) || modes[0];
+        if (joined && current && current[1] > SAFE_W)
+            oversizedJoin = true;
+    }
+    return {unknownExternal, oversizedJoin, needsHint: unknownExternal.length > 0 || oversizedJoin};
+}

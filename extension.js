@@ -11,6 +11,7 @@ import {
     SAFE_SCALE,
     SAFE_W,
     TRANSFORM_NORMAL,
+    assessExternalLayout,
     buildConnectorIndex,
     buildJoinMonitors,
     buildMirrorMembers,
@@ -33,6 +34,10 @@ const METHOD_TEMPORARY = 1;
 const DBUS_TIMEOUT_MS = 10000;
 // Watchdog slightly above the D-Bus timeout: last-resort busy release.
 const WATCHDOG_MS = 12000;
+// Watcher tuning: replug bursts (plus KOA/BDL EDID flips) are collapsed
+// by the settle delay; our own applies stay quiet for a while after.
+const SETTLE_MS = 2000;
+const SELF_QUIET_US = 4000000;
 
 class DisplayConfigClient {
     constructor() {
@@ -69,6 +74,21 @@ class DisplayConfigClient {
 
     get ready() {
         return this._proxy !== null;
+    }
+
+    onMonitorsChanged(callback) {
+        return this._proxy.connect('g-signal', (proxy, sender, name) => {
+            if (name === 'MonitorsChanged')
+                callback();
+        });
+    }
+
+    offMonitorsChanged(handlerId) {
+        try {
+            this._proxy.disconnect(handlerId);
+        } catch (e) {
+            // Already disconnected.
+        }
     }
 
     call(method, params) {
@@ -165,7 +185,12 @@ export default class DisplayRescueExtension extends Extension {
     enable() {
         this._settings = this.getSettings();
         this._client = new DisplayConfigClient();
-        this._starting = this._client.init().catch(e => {
+        this._starting = this._client.init().then(() => {
+            // Subscribe only once the proxy exists; the id is released
+            // in disable() so no signal connection outlives the session.
+            if (this._client)
+                this._monitorsSignalId = this._client.onMonitorsChanged(() => this._onMonitorsChanged());
+        }).catch(e => {
             log(`[display-rescue] DisplayConfig proxy failed: ${e.message}`);
         });
         // Busy flag bounds transient memory under key spam: one in-flight
@@ -174,6 +199,9 @@ export default class DisplayRescueExtension extends Extension {
         this._busy = false;
         this._epoch = (this._epoch || 0) + 1;
         this._watchdog = 0;
+        this._settleTimer = 0;
+        this._lastSelfApply = 0;
+        this._monitorsSignalId = 0;
 
         this._mirrorHandler = () => this._runExclusive('Mirror', () => this._onMirror());
         this._joinHandler = () => this._runExclusive('Join', () => this._onJoin());
@@ -191,6 +219,14 @@ export default class DisplayRescueExtension extends Extension {
         // instead of touching a released client.
         this._epoch = (this._epoch || 0) + 1;
         this._busy = false;
+        if (this._settleTimer) {
+            try {
+                GLib.source_remove(this._settleTimer);
+            } catch (e) {
+                // Already fired or removed.
+            }
+            this._settleTimer = 0;
+        }
         if (this._watchdog) {
             try {
                 GLib.source_remove(this._watchdog);
@@ -207,6 +243,9 @@ export default class DisplayRescueExtension extends Extension {
             }
         }
         if (this._client) {
+            if (this._monitorsSignalId)
+                this._client.offMonitorsChanged(this._monitorsSignalId);
+            this._monitorsSignalId = 0;
             this._client.release();
             this._client = null;
         }
@@ -258,6 +297,9 @@ export default class DisplayRescueExtension extends Extension {
     }
 
     async _attemptApply(serial, logicalMonitors, properties) {
+        // Stamp self-triggered reconfigures so the MonitorsChanged watcher
+        // stays quiet about layouts we applied ourselves.
+        this._lastSelfApply = GLib.get_monotonic_time();
         try {
             await this._client.apply(serial, METHOD_VERIFY, logicalMonitors, properties);
         } catch (e) {
@@ -401,6 +443,50 @@ export default class DisplayRescueExtension extends Extension {
             log(`[display-rescue] read monitors.xml failed: ${e.message}`);
         }
         writeMonitorsXml(buildSafeMirrorsXml(builtinSpec, builtinMode, [...seen.values()]));
+    }
+
+    _onMonitorsChanged() {
+        // Our own applies also emit this signal: stay quiet for a while.
+        if (GLib.get_monotonic_time() - this._lastSelfApply < SELF_QUIET_US) {
+            log('[display-rescue] MonitorsChanged ignored (self apply)');
+            return;
+        }
+        // Collapse replug bursts into a single assessment after settle.
+        if (this._settleTimer)
+            GLib.source_remove(this._settleTimer);
+        const epoch = this._epoch;
+        this._settleTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SETTLE_MS, () => {
+            this._settleTimer = 0;
+            if (this._epoch === epoch)
+                this._assessAfterSettle(epoch).catch(e => {
+                    log(`[display-rescue] settle assessment failed: ${e.message}`);
+                });
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    async _assessAfterSettle(epoch) {
+        if (!this._alive(epoch))
+            return;
+        const {monitors, logicalMonitors} = await this._client.getState();
+        if (!this._alive(epoch))
+            return;
+        let known = [];
+        try {
+            const [ok, bytes] = GLib.file_get_contents(monitorsXmlPath());
+            if (ok)
+                known = collectExternalSpecsFromXml(new TextDecoder().decode(bytes));
+        } catch (e) {
+            log(`[display-rescue] read monitors.xml failed: ${e.message}`);
+        }
+        const verdict = assessExternalLayout(monitors, logicalMonitors, known);
+        if (!verdict.needsHint) {
+            log('[display-rescue] settle assessment: layout looks safe');
+            return;
+        }
+        const unknown = verdict.unknownExternal.map(s => s.join('/')).join(', ');
+        log(`[display-rescue] replugged layout needs attention: unknown=[${unknown}] oversizedJoin=${verdict.oversizedJoin}`);
+        showOsd('Display changed — Super+Alt+M for safe mirror');
     }
 
     _onError(action, e) {
