@@ -28,6 +28,12 @@ const METHOD_VERIFY = 0;
 const METHOD_PERSISTENT = 2;
 const METHOD_TEMPORARY = 1;
 
+// Finite D-Bus timeout: a replug mid-apply must fail the call instead of
+// hanging it forever (which used to wedge the hotkeys via _busy).
+const DBUS_TIMEOUT_MS = 10000;
+// Watchdog slightly above the D-Bus timeout: last-resort busy release.
+const WATCHDOG_MS = 12000;
+
 class DisplayConfigClient {
     constructor() {
         this._proxy = null;
@@ -71,7 +77,7 @@ class DisplayConfigClient {
                 method,
                 params,
                 Gio.DBusCallFlags.NONE,
-                -1,
+                DBUS_TIMEOUT_MS,
                 null,
                 (proxy, res) => {
                     try {
@@ -167,6 +173,7 @@ export default class DisplayRescueExtension extends Extension {
         // results after disable() instead of retaining a dead client.
         this._busy = false;
         this._epoch = (this._epoch || 0) + 1;
+        this._watchdog = 0;
 
         this._mirrorHandler = () => this._runExclusive('Mirror', () => this._onMirror());
         this._joinHandler = () => this._runExclusive('Join', () => this._onJoin());
@@ -184,6 +191,14 @@ export default class DisplayRescueExtension extends Extension {
         // instead of touching a released client.
         this._epoch = (this._epoch || 0) + 1;
         this._busy = false;
+        if (this._watchdog) {
+            try {
+                GLib.source_remove(this._watchdog);
+            } catch (e) {
+                // Already fired or removed.
+            }
+            this._watchdog = 0;
+        }
         for (const key of ['mirror', 'join', 'reset']) {
             try {
                 Main.wm.removeKeybinding(key);
@@ -219,10 +234,22 @@ export default class DisplayRescueExtension extends Extension {
             return Promise.resolve();
         }
         this._busy = true;
-        const epoch = this._epoch;
+        // Watchdog: if a D-Bus call hangs past its timeout (cable pulled
+        // mid-apply), release the hotkeys instead of wedging them forever.
+        // The epoch alive-checks inside the handlers still guard disable().
+        this._watchdog = GLib.timeout_add(GLib.PRIORITY_DEFAULT, WATCHDOG_MS, () => {
+            this._watchdog = 0;
+            log(`[display-rescue] ${action} timed out, releasing hotkeys`);
+            this._busy = false;
+            showOsd(`${action} timed out`);
+            return GLib.SOURCE_REMOVE;
+        });
         return fn().catch(e => this._onError(action, e)).finally(() => {
-            if (this._epoch === epoch)
-                this._busy = false;
+            if (this._watchdog) {
+                GLib.source_remove(this._watchdog);
+                this._watchdog = 0;
+            }
+            this._busy = false;
         });
     }
 
