@@ -1,0 +1,7 @@
+{
+  "uuid": "display-rescue@star-barsuk",
+  "name": "Display Rescue",
+  "description": "Blind-safe hotkeys for vanilla Mirror / Join via Mutter DisplayConfig, plus config reset. For HDMI TV setups where Join hides windows on the TV.",
+  "shell-version": ["50"],
+  "settings-schema": "org.gnome.shell.extensions.display-rescue"
+}

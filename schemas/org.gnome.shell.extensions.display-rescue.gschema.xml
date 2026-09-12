@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist gettext-domain="display-rescue">
+
+  <schema id="org.gnome.shell.extensions.display-rescue"
+          path="/org/gnome/shell/extensions/display-rescue/">
+
+    <key name="mirror" type="as">
+      <default>['&lt;Super&gt;&lt;Alt&gt;m']</default>
+      <summary>Mirror displays</summary>
+      <description>Vanilla clone: same image on all outputs (same call as Settings Mirror)</description>
+    </key>
+
+    <key name="join" type="as">
+      <default>['&lt;Super&gt;&lt;Alt&gt;j']</default>
+      <summary>Join displays</summary>
+      <description>Vanilla extend: built-in left primary, HDMI right (same call as Settings Join)</description>
+    </key>
+
+    <key name="reset" type="as">
+      <default>['&lt;Super&gt;&lt;Alt&gt;r']</default>
+      <summary>Reset display config</summary>
+      <description>Backup monitors.xml and force safe 1080p mirror</description>
+    </key>
+
+  </schema>
+
+</schemalist>
