@@ -8,7 +8,6 @@
 export const SAFE_W = 1920;
 export const SAFE_H = 1080;
 export const SAFE_SCALE = 1.0;
-export const SAFE_RATE = '60.000';
 export const TRANSFORM_NORMAL = 0;
 export const LAYOUT_LOGICAL = 1;
 
@@ -158,16 +157,9 @@ export function buildJoinMonitors(index, connectors, currentLogical) {
     return logicalMonitors;
 }
 
-export function escapeXml(value) {
-    return String(value)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
-}
-
 export function collectExternalSpecsFromXml(text) {
-    // Harvest every non-built-in monitorspec ever stored, so a future
-    // EDID flip (KOA vs BDL dongles) still matches a safe mirror config.
+    // Harvest every non-built-in monitorspec ever stored, so the watcher
+    // can tell a never-seen EDID from a known one (read-only use).
     const specs = [];
     const re = /<monitor>\s*<monitorspec>\s*<connector>([^<]*)<\/connector>\s*<vendor>([^<]*)<\/vendor>\s*<product>([^<]*)<\/product>\s*<serial>([^<]*)<\/serial>/g;
     let m;
@@ -179,54 +171,17 @@ export function collectExternalSpecsFromXml(text) {
     return specs;
 }
 
-export function buildSafeMirrorsXml(builtinSpec, builtinMode, externalSpecs) {
-    const monitorBlock = (spec, w, h, rate) => `      <monitor>
-        <monitorspec>
-          <connector>${escapeXml(spec[0])}</connector>
-          <vendor>${escapeXml(spec[1])}</vendor>
-          <product>${escapeXml(spec[2])}</product>
-          <serial>${escapeXml(spec[3])}</serial>
-        </monitorspec>
-        <mode>
-          <width>${w}</width>
-          <height>${h}</height>
-          <rate>${rate}</rate>
-        </mode>
-      </monitor>`;
-    const builtinBlock = monitorBlock(builtinSpec, builtinMode.width, builtinMode.height, builtinMode.rate);
-    const parts = externalSpecs.map(ext => `  <configuration>
-    <layoutmode>logical</layoutmode>
-    <logicalmonitor>
-      <x>0</x>
-      <y>0</y>
-      <scale>1</scale>
-      <primary>yes</primary>
-${builtinBlock}
-${monitorBlock(ext, SAFE_W, SAFE_H, SAFE_RATE)}
-    </logicalmonitor>
-  </configuration>`);
-    if (parts.length === 0) {
-        parts.push(`  <configuration>
-    <layoutmode>logical</layoutmode>
-    <logicalmonitor>
-      <x>0</x>
-      <y>0</y>
-      <scale>1</scale>
-      <primary>yes</primary>
-${builtinBlock}
-    </logicalmonitor>
-  </configuration>`);
-    }
-    return `<monitors version="2">\n${parts.join('\n')}\n</monitors>\n`;
-}
-
 export function assessExternalLayout(liveMonitors, logicalMonitors, knownExternalSpecs) {
     // Decides whether the user needs a blind hint after a replug, without
     // ever switching anything automatically. Returns plain data so the
     // shell side only formats and shows it.
     // liveMonitors: raw unpacked GetCurrentState entries [spec, modes, props].
     // knownExternalSpecs: specs harvested from monitors.xml history.
-    const known = new Set((knownExternalSpecs || []).map(s => s.join('|')));
+    // null history means "unreadable": skip the unknown check instead of
+    // flagging every external output (avoids hint spam on a broken file).
+    const known = knownExternalSpecs
+        ? new Set(knownExternalSpecs.map(s => s.join('|')))
+        : null;
     const unknownExternal = [];
     let oversizedJoin = false;
     const joined = logicalMonitors.length > 1;
@@ -236,7 +191,7 @@ export function assessExternalLayout(liveMonitors, logicalMonitors, knownExterna
         const props = entry[2];
         if ((props && props['is-builtin']) || isBuiltinConnector(spec[0]))
             continue;
-        if (!known.has(spec.join('|')))
+        if (known && !known.has(spec.join('|')))
             unknownExternal.push(spec);
         const current = modes.find(m => m[6] && m[6]['is-current']) || modes[0];
         if (joined && current && current[1] > SAFE_W)

@@ -6,9 +6,7 @@ import {
     buildConnectorIndex,
     buildJoinMonitors,
     buildMirrorMembers,
-    buildSafeMirrorsXml,
     collectExternalSpecsFromXml,
-    escapeXml,
     findCommonSize,
     orderConnectors,
     pickModeId,
@@ -78,13 +76,6 @@ const xmlSample = '<monitors version="2">'
 check('collect skips builtin', collectExternalSpecsFromXml(xmlSample),
     [['HDMI-1', 'KOA', 'OneMeeting', '0x00000001'],
         ['HDMI-1', 'BDL', 'OneMeeting', '0x01010101']]);
-check('escapeXml', escapeXml('A&B<C>D'), 'A&amp;B&lt;C&gt;D');
-
-const xml = buildSafeMirrorsXml(['eDP-1', 'CSO', '0x142e', '0x00000000'],
-    {width: 1920, height: 1080, rate: '60.000'},
-    [['HDMI-1', 'KOA', 'OneMeeting', '0x00000001']]);
-check('xml has one mirror config', (xml.match(/<configuration>/g) || []).length, 1);
-check('xml has no 4K', xml.includes('3840'), false);
 
 // Watcher decision logic: replug assessment.
 const JOIN_4K_LOGICAL = [
@@ -116,5 +107,8 @@ const JOIN_1080_LOGICAL = [
 ];
 const cleanJoin = assessExternalLayout(MONITORS, JOIN_1080_LOGICAL, KNOWN);
 check('known 1080p join needs no hint', cleanJoin.needsHint, false);
+
+const unreadableHistory = assessExternalLayout(MONITORS, LOGICAL_MIRROR, null);
+check('unreadable history skips unknown check', unreadableHistory.needsHint, false);
 
 print(`\n${passed} assertions passed`);

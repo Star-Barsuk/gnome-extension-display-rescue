@@ -7,7 +7,6 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {
     LAYOUT_LOGICAL,
     SAFE_H,
-    SAFE_RATE,
     SAFE_SCALE,
     SAFE_W,
     TRANSFORM_NORMAL,
@@ -15,9 +14,7 @@ import {
     buildConnectorIndex,
     buildJoinMonitors,
     buildMirrorMembers,
-    buildSafeMirrorsXml,
     collectExternalSpecsFromXml,
-    isBuiltinConnector,
     orderConnectors,
     pickModeId,
 } from './displayLogic.js';
@@ -170,28 +167,30 @@ function backupMonitorsXml() {
     }
 }
 
-function writeMonitorsXml(text) {
-    const dest = Gio.File.new_for_path(monitorsXmlPath());
-    dest.replace_contents(
-        new TextEncoder().encode(text),
-        null,
-        false,
-        Gio.FileCreateFlags.REPLACE_DESTINATION,
-        null
-    );
-}
-
 export default class DisplayRescueExtension extends Extension {
     enable() {
-        this._settings = this.getSettings();
+        try {
+            this._settings = this.getSettings();
+        } catch (e) {
+            // Missing schema = packaging bug. Fail loud (ERROR state) with
+            // a clear log instead of running half-dead without keybindings.
+            log(`[display-rescue] settings schema missing, cannot enable: ${e.message}`);
+            throw e;
+        }
         this._client = new DisplayConfigClient();
-        this._starting = this._client.init().then(() => {
+        // Capture the client: on a fast disable/enable cycle an older
+        // init chain must not subscribe its dead proxy over the new one.
+        const client = this._client;
+        this._connecting = true;
+        this._starting = client.init().then(() => {
             // Subscribe only once the proxy exists; the id is released
             // in disable() so no signal connection outlives the session.
-            if (this._client)
-                this._monitorsSignalId = this._client.onMonitorsChanged(() => this._onMonitorsChanged());
+            if (this._client === client && client.ready)
+                this._monitorsSignalId = client.onMonitorsChanged(() => this._onMonitorsChanged());
         }).catch(e => {
             log(`[display-rescue] DisplayConfig proxy failed: ${e.message}`);
+        }).finally(() => {
+            this._connecting = false;
         });
         // Busy flag bounds transient memory under key spam: one in-flight
         // apply at a time, no stacked unpacked states. Epoch discards late
@@ -202,6 +201,13 @@ export default class DisplayRescueExtension extends Extension {
         this._settleTimer = 0;
         this._lastSelfApply = 0;
         this._monitorsSignalId = 0;
+        this._reconnecting = false;
+        // Reconnect if Mutter restarts: without this the proxy stays dead
+        // until the extension is toggled manually.
+        this._nameWatcher = Gio.bus_watch_name(Gio.BusType.SESSION, BUS_NAME,
+            Gio.BusNameWatcherFlags.NONE,
+            () => this._onDisplayConfigAppeared(),
+            () => log('[display-rescue] DisplayConfig service vanished'));
 
         this._mirrorHandler = () => this._runExclusive('Mirror', () => this._onMirror());
         this._joinHandler = () => this._runExclusive('Join', () => this._onJoin());
@@ -219,6 +225,16 @@ export default class DisplayRescueExtension extends Extension {
         // instead of touching a released client.
         this._epoch = (this._epoch || 0) + 1;
         this._busy = false;
+        this._reconnecting = false;
+        this._connecting = false;
+        if (this._nameWatcher) {
+            try {
+                Gio.bus_unwatch_name(this._nameWatcher);
+            } catch (e) {
+                // Already unwatched.
+            }
+            this._nameWatcher = 0;
+        }
         if (this._settleTimer) {
             try {
                 GLib.source_remove(this._settleTimer);
@@ -267,6 +283,24 @@ export default class DisplayRescueExtension extends Extension {
             throw new Error('DisplayConfig service unavailable');
     }
 
+    _onDisplayConfigAppeared() {
+        // Fires once at watch time too: only reconnect a dead proxy, and
+        // never race an in-flight initial init.
+        if (!this._client || this._client.ready || this._reconnecting || this._connecting)
+            return;
+        this._reconnecting = true;
+        const client = this._client;
+        log('[display-rescue] DisplayConfig reappeared, reconnecting');
+        client.init().then(() => {
+            if (this._client === client && client.ready)
+                this._monitorsSignalId = client.onMonitorsChanged(() => this._onMonitorsChanged());
+        }).catch(e => {
+            log(`[display-rescue] DisplayConfig reconnect failed: ${e.message}`);
+        }).finally(() => {
+            this._reconnecting = false;
+        });
+    }
+
     _runExclusive(action, fn) {
         if (this._busy) {
             log(`[display-rescue] ${action} ignored: another apply in flight`);
@@ -280,7 +314,11 @@ export default class DisplayRescueExtension extends Extension {
             this._watchdog = 0;
             log(`[display-rescue] ${action} timed out, releasing hotkeys`);
             this._busy = false;
-            showOsd(`${action} timed out`);
+            // Report the factual layout instead of a bare error: a slow
+            // modeset may still have succeeded after the timeout.
+            this._reportActualLayout(action).catch(e => {
+                log(`[display-rescue] layout report failed: ${e.message}`);
+            });
             return GLib.SOURCE_REMOVE;
         });
         return fn().catch(e => this._onError(action, e)).finally(() => {
@@ -387,62 +425,14 @@ export default class DisplayRescueExtension extends Extension {
             {'layout-mode': GLib.Variant.new_uint32(LAYOUT_LOGICAL)});
         if (!this._alive(epoch))
             return;
-        // Purge stale configs (e.g. the 4K Join) so the next hotplug or
-        // EDID flip cannot resurrect the bad layout automatically.
-        try {
-            this._purgeStaleConfigs(monitors);
-        } catch (e) {
-            log(`[display-rescue] purge failed: ${e.message}`);
-        }
+        // NOTE: no file rewrite here on purpose. Mutter is the sole writer
+        // of monitors.xml from its in-memory store and always wins a write
+        // race, so a file-level purge cannot stick while the session runs.
+        // Reset = backup plus safe mirror; the watcher hints if a bad
+        // layout ever comes back by itself.
         warpToPrimaryCenter();
         showOsd(backupPath ? `Reset to 1080p mirror (backup kept)` : 'Reset to 1080p mirror');
-        log('[display-rescue] Reset applied: 1080p mirror, stale configs purged');
-    }
-
-    _purgeStaleConfigs(liveMonitors) {
-        let builtinSpec = null;
-        let builtinMode = {width: SAFE_W, height: SAFE_H, rate: SAFE_RATE};
-        for (const entry of liveMonitors) {
-            const spec = entry[0];
-            const modes = entry[1];
-            const props = entry[2];
-            const builtin = (props && props['is-builtin']) || isBuiltinConnector(spec[0]);
-            if (builtin && !builtinSpec) {
-                builtinSpec = spec;
-                const current = modes.find(m => m[6] && m[6]['is-current']) || modes[0];
-                if (current) {
-                    builtinMode = {
-                        width: current[1],
-                        height: current[2],
-                        rate: Number(current[3]).toFixed(3),
-                    };
-                }
-            }
-        }
-        if (!builtinSpec)
-            return;
-        const seen = new Map();
-        const addSpec = spec => {
-            const key = spec.join('|');
-            if (!seen.has(key))
-                seen.set(key, spec);
-        };
-        for (const entry of liveMonitors) {
-            const spec = entry[0];
-            const props = entry[2];
-            const builtin = (props && props['is-builtin']) || isBuiltinConnector(spec[0]);
-            if (!builtin)
-                addSpec(spec);
-        }
-        try {
-            const [ok, bytes] = GLib.file_get_contents(monitorsXmlPath());
-            if (ok)
-                for (const spec of collectExternalSpecsFromXml(new TextDecoder().decode(bytes)))
-                    addSpec(spec);
-        } catch (e) {
-            log(`[display-rescue] read monitors.xml failed: ${e.message}`);
-        }
-        writeMonitorsXml(buildSafeMirrorsXml(builtinSpec, builtinMode, [...seen.values()]));
+        log('[display-rescue] Reset applied: 1080p mirror');
     }
 
     _onMonitorsChanged() {
@@ -471,7 +461,7 @@ export default class DisplayRescueExtension extends Extension {
         const {monitors, logicalMonitors} = await this._client.getState();
         if (!this._alive(epoch))
             return;
-        let known = [];
+        let known = null;
         try {
             const [ok, bytes] = GLib.file_get_contents(monitorsXmlPath());
             if (ok)
@@ -487,6 +477,18 @@ export default class DisplayRescueExtension extends Extension {
         const unknown = verdict.unknownExternal.map(s => s.join('/')).join(', ');
         log(`[display-rescue] replugged layout needs attention: unknown=[${unknown}] oversizedJoin=${verdict.oversizedJoin}`);
         showOsd('Display changed — Super+Alt+M for safe mirror');
+    }
+
+    async _reportActualLayout(action) {
+        if (!this._client || !this._client.ready)
+            return;
+        const {logicalMonitors} = await this._client.getState();
+        const members = logicalMonitors.reduce((n, lm) => n + lm[5].length, 0);
+        const label = logicalMonitors.length > 1
+            ? 'Join'
+            : members > 1 ? 'Mirror' : 'Single';
+        showOsd(`${action} timed out — now: ${label}`);
+        log(`[display-rescue] ${action} timed out, actual layout: ${label}`);
     }
 
     _onError(action, e) {
