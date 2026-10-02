@@ -9,7 +9,7 @@ SRC = extension.js displayLogic.js prefs.js metadata.json
 SCHEMA_DIR = schemas
 TESTS = tests/run.js
 
-.PHONY: build install uninstall enable disable zip test lint clean
+.PHONY: build install uninstall enable disable zip test lint ci clean
 
 build: $(COMPILED_SCHEMAS)
 
@@ -46,6 +46,8 @@ test:
 lint: test
 	python3 -c "import json; json.load(open('metadata.json')); print('metadata.json: valid')"
 	python3 -c "import xml.dom.minidom; xml.dom.minidom.parse('$(SCHEMAS)'); print('schema xml: valid')"
+
+ci: lint
 
 clean:
 	rm -f $(COMPILED_SCHEMAS)

@@ -4,3 +4,7 @@ schemas/gschemas.compiled
 # Distribution packages
 *.zip
 _zipdir/
+
+# Private project documents (backed up in shosoin)
+AGENTS.md
+docs/
